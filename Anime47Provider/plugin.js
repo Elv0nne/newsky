@@ -1,55 +1,326 @@
 (function () {
     /**
-     * Anime47 — SkyStream Gen 2 Plugin
-     * Port từ CloudStream plugin gốc (Anime47Provider.kt) sang JavaScript cho SkyStream.
+     * Anime47 plugin for SkyStream.
      *
-     * Ghi chú port:
-     * - mainUrl (manifest.baseUrl) dùng để build link xem / poster / referer.
-     * - apiBaseUrl KHÔNG đổi theo domain đã chọn (giống bản gốc Kotlin: mainUrl và apiBaseUrl
-     *   là 2 domain khác nhau -- anime47.best cho trang xem, anime47.love/api cho API).
-     * - Đăng nhập: bản CloudStream gốc có màn hình Settings để người dùng tự nhập email/password.
-     *   SkyStream JS-plugin không có UI riêng cho việc này nên theo yêu cầu, tài khoản dùng chung
-     *   được hardcode thẳng bên dưới (ACCOUNT_EMAIL / ACCOUNT_PASSWORD). Đổi lại giá trị của bạn.
+     * Logic reference: ported (rewritten, not copy-pasted) from an existing
+     * CloudStream3 Kotlin provider for the same site. The site exposes a JSON
+     * API under {API_BASE}/api rather than server-rendered HTML, so this
+     * plugin talks to that API directly instead of scraping HTML.
      *
-     * VÁ LỖI PHÁT VIDEO (server FE + HY):
-     * - Server FE dùng CDN `cdn<N>.nonprofit.asia`, CDN này trả về vài byte rác ở đầu mỗi segment
-     *   .ts khiến player không tìm được sync-byte MPEG-TS hợp lệ. Bản gốc vá bằng OkHttp Interceptor
-     *   (getVideoInterceptor()).
-     * - Server HY (Hydrax/Abyss) không trả link phát trực tiếp: trang embed chứa blob mã hoá AES-CTR
-     *   cần giải mã để lấy danh sách nguồn CDN, và video chia thành segment 2MB cũng mã hoá riêng
-     *   từng phần — bản gốc phải viết hẳn 1 Interceptor giả lập file ảo (HydraxInterceptor).
-     * - SkyStream JS runtime không có hook can thiệp byte-stream khi player đang phát, nên không
-     *   port y hệt ở tầng plugin được. Giải pháp: một Cloudflare Worker riêng (xem worker.js cùng
-     *   thư mục) đứng giữa player và nguồn thật, tự vá byte (FE) hoặc giải mã + ghép segment (HY)
-     *   rồi trả lại dữ liệu sạch. Deploy Worker đó rồi điền domain vào WORKER_PROXY_BASE bên dưới.
+     * Multi-server playback:
+     *   - Most servers on Anime47 return a direct .m3u8 URL -> played as-is.
+     *   - The "HY" server (Hydrax / Abyss.to) does NOT return a playable URL.
+     *     It returns an embed page containing an AES-CTR encrypted blob. That
+     *     blob is decrypted server-side via the community "enc-dec.app"
+     *     helper API (same approach used by other SkyStream anime plugins for
+     *     Abyss/Hydrax embeds), which returns the real source list.
      */
 
-    // ===================== Config =====================
-
+    const MAIN_URL = (typeof manifest !== "undefined" && manifest.baseUrl) || "https://anime47.best";
+    // Anime47's JSON API historically lives on a sibling domain. If the API
+    // ever moves to the same host as baseUrl, change API_BASE to MAIN_URL.
     const API_BASE = "https://anime47.love/api";
 
-    // Domain Cloudflare Worker (xem file worker.js) đã deploy — vá lỗi phát cho cả server FE và HY.
-    // Để trống ("") nếu chưa deploy — lúc đó cả 2 server nhiều khả năng sẽ không phát được.
-    const WORKER_PROXY_BASE = "https://anime47-fix.sumaymanlon.workers.dev";
+    const UA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
 
-    // TODO: điền tài khoản Anime47 dùng chung tại đây.
+    const HEADERS = {
+        "User-Agent": UA,
+        "Origin": MAIN_URL,
+        "Referer": MAIN_URL + "/"
+    };
+
+    // ===================== hardcoded account (private use only) =====================
+    // WARNING: plain-text credentials baked into the plugin. Do not publish this
+    // file/repo publicly unless you're fine with the account being exposed.
     const ACCOUNT_EMAIL = "sumaymanlon@gmail.com";
     const ACCOUNT_PASSWORD = "Kobe1234@";
 
-    const DEFAULT_UA =
-        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36";
+    let cachedToken = null;
+    let tokenPromise = null;
 
-    const SUBTITLE_LANGUAGE_MAP = {
-        Vietnamese: ["tiếng việt", "vietnamese", "vietsub", "viet", "vi"],
-        English: ["tiếng anh", "english", "engsub", "eng", "en"],
-    };
+    async function login() {
+        const body = { login: ACCOUNT_EMAIL, password: ACCOUNT_PASSWORD };
+        const res = await postJson(API_BASE + "/auth/login", {
+            "Content-Type": "application/json",
+            "Origin": MAIN_URL,
+            "Referer": MAIN_URL + "/"
+        }, body);
+        if (!res || !res.access_token) throw new Error("Đăng nhập Anime47 thất bại.");
+        return res.access_token;
+    }
 
-    // Domain server HY (Hydrax/Abyss) — khớp HY_HOSTS trong HydraxExtractor.kt gốc.
-    const HYDRAX_HOSTS = ["abysscdn.com", "playhydrax.com", "zplayer.io", "short.ink"];
+    // Ensures we have a valid token, logging in at most once concurrently.
+    async function ensureToken() {
+        if (cachedToken) return cachedToken;
+        if (!tokenPromise) {
+            tokenPromise = login()
+                .then(function (token) {
+                    cachedToken = token;
+                    tokenPromise = null;
+                    return token;
+                })
+                .catch(function (e) {
+                    tokenPromise = null;
+                    throw e;
+                });
+        }
+        return tokenPromise;
+    }
 
-    function getHydraxVideoId(rawUrl) {
+    async function authHeaders() {
         try {
-            const u = new URL(rawUrl);
+            const token = await ensureToken();
+            return { "Authorization": "Bearer " + token };
+        } catch (e) {
+            return {};
+        }
+    }
+
+    // ===================== small helpers =====================
+
+    function safeParse(data) {
+        if (!data) return null;
+        if (typeof data === "object") return data;
+        try {
+            return JSON.parse(data);
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function fixUrl(raw) {
+        if (!raw) return "";
+        const url = String(raw).trim();
+        if (!url || url.startsWith("data:")) return "";
+        if (/via\.placeholder\.com/i.test(url)) return "";
+        if (url.startsWith("//")) return "https:" + url;
+        if (/^https?:\/\//i.test(url)) return url;
+        try {
+            return new URL(url, MAIN_URL).href;
+        } catch (e) {
+            return "";
+        }
+    }
+
+    function digitsOnly(value) {
+        const match = String(value || "").match(/\d+/);
+        return match ? parseInt(match[0], 10) : undefined;
+    }
+
+    function getHost(url) {
+        try {
+            return new URL(url).hostname.replace(/^www\./, "");
+        } catch (e) {
+            return "";
+        }
+    }
+
+    async function fetchJsonWithAuth(url, extraHeaders) {
+        const auth = await authHeaders();
+        const headers = Object.assign({}, HEADERS, extraHeaders || {}, auth);
+        const res = await http_get(url, headers);
+        return (res && res.body) || "";
+    }
+
+    // GETs `url` as JSON, automatically attaching the cached auth token.
+    // If the response is gated by PRIVATE_MODE, forces a fresh login once
+    // and retries (covers the case where a cached token has expired).
+    async function getJson(url, headers) {
+        let body = await fetchJsonWithAuth(url, headers);
+
+        if (body.indexOf('"PRIVATE_MODE"') !== -1) {
+            cachedToken = null;
+            body = await fetchJsonWithAuth(url, headers);
+        }
+
+        if (body.indexOf('"PRIVATE_MODE"') !== -1) {
+            throw new Error("Trang yêu cầu đăng nhập (PRIVATE_MODE) và đăng nhập tài khoản cấu hình sẵn thất bại.");
+        }
+
+        const data = safeParse(body);
+        if (!data) throw new Error("Không parse được JSON từ: " + url);
+        return data;
+    }
+
+    async function postJson(url, headers, bodyObj) {
+        const res = await http_post(url, headers, JSON.stringify(bodyObj));
+        const body = res && res.body ? res.body : "";
+        return safeParse(body);
+    }
+
+    // ===================== mapping helpers =====================
+
+    function mediaItemFromPost(post) {
+        const link = fixUrl(post.link);
+        if (!link || !post.title) return null;
+        const epLabel = post.current_episode || post.episodes;
+        const item = new MultimediaItem({
+            title: post.title,
+            url: link,
+            posterUrl: fixUrl(post.poster || post.image),
+            type: "anime",
+            year: post.year ? digitsOnly(post.year) : undefined
+        });
+        if (epLabel) item.description = "Tập hiện tại: " + epLabel;
+        return item;
+    }
+
+    // ===================== 1. getHome =====================
+
+    const HOME_SECTIONS = [
+        { path: "/anime/filter?lang=vi&sort=latest", name: "Anime Mới Cập Nhật" },
+        { path: "/anime/filter?lang=vi&sort=rating", name: "Top Đánh Giá" },
+        { path: "/anime/filter?lang=vi&type=tv", name: "Anime TV" },
+        { path: "/anime/filter?lang=vi&type=movie", name: "Anime Movie" }
+    ];
+
+    async function getHome(cb) {
+        try {
+            const home = {};
+            for (const section of HOME_SECTIONS) {
+                try {
+                    const data = await getJson(API_BASE + section.path + "&page=1");
+                    const posts = data && data.data && data.data.posts ? data.data.posts : [];
+                    const items = posts.map(mediaItemFromPost).filter(Boolean);
+                    if (items.length) home[section.name] = items;
+                } catch (e) {
+                    // one section failing shouldn't break the whole dashboard
+                }
+            }
+            if (!Object.keys(home).length) {
+                return cb({ success: false, errorCode: "SITE_OFFLINE", message: "Không tải được trang chủ Anime47." });
+            }
+            cb({ success: true, data: home });
+        } catch (e) {
+            cb({ success: false, errorCode: "SITE_OFFLINE", message: e.message || String(e) });
+        }
+    }
+
+    // ===================== 2. search =====================
+
+    async function search(query, cb) {
+        try {
+            const url = API_BASE + "/search/full/?lang=vi&keyword=" + encodeURIComponent(query) + "&page=1";
+            const data = await getJson(url);
+            const results = (data && data.results) || [];
+            const items = results.map(function (item) {
+                return mediaItemFromPost({
+                    title: item.title,
+                    link: item.link,
+                    poster: item.image,
+                    year: null,
+                    current_episode: item.current_episode,
+                    episodes: item.episodes
+                });
+            }).filter(Boolean);
+            cb({ success: true, data: items });
+        } catch (e) {
+            cb({ success: false, errorCode: "PARSE_ERROR", message: e.message || String(e) });
+        }
+    }
+
+    // ===================== 3. load =====================
+
+    function extractAnimeId(url) {
+        const match = String(url || "").replace(/\/$/, "").match(/(\d+)(?:\.html)?$/);
+        return match ? match[1] : null;
+    }
+
+    async function load(url, cb) {
+        try {
+            const animeId = extractAnimeId(url);
+            if (!animeId) throw new Error("Không lấy được ID anime từ URL: " + url);
+
+            const [infoRes, episodesRes, recsRes] = await Promise.all([
+                getJson(API_BASE + "/anime/info/" + animeId + "?lang=vi").catch(function () { return null; }),
+                getJson(API_BASE + "/anime/" + animeId + "/episodes?lang=vi").catch(function () { return null; }),
+                getJson(API_BASE + "/anime/info/" + animeId + "/recommendations?lang=vi").catch(function () { return null; })
+            ]);
+
+            const detail = infoRes && infoRes.data;
+            if (!detail) throw new Error("Không tải được thông tin phim.");
+
+            // Flatten teams -> groups -> episodes, then dedupe/group by episode number.
+            const allEpisodes = [];
+            if (episodesRes && Array.isArray(episodesRes.teams)) {
+                episodesRes.teams.forEach(function (team) {
+                    (team.groups || []).forEach(function (group) {
+                        (group.episodes || []).forEach(function (ep) {
+                            if (ep && ep.number != null) allEpisodes.push(ep);
+                        });
+                    });
+                });
+            }
+
+            const byNumber = {};
+            allEpisodes.forEach(function (ep) {
+                const num = ep.number;
+                if (!byNumber[num]) byNumber[num] = [];
+                if (byNumber[num].indexOf(ep.id) === -1) byNumber[num].push(ep.id);
+            });
+
+            const episodeNumbers = Object.keys(byNumber).map(Number).sort(function (a, b) { return a - b; });
+
+            const episodes = episodeNumbers.map(function (num) {
+                // data payload = JSON list of episode ids sharing this number
+                // (different fansub "teams" often re-upload the same episode
+                // number under different ids; loadStreams tries them all).
+                return new Episode({
+                    name: "Tập " + num,
+                    url: JSON.stringify(byNumber[num]),
+                    season: 1,
+                    episode: num
+                });
+            });
+
+            const posterUrl = fixUrl(detail.poster);
+            const genres = (detail.genres || []).map(function (g) { return g.name; }).filter(Boolean);
+            const cast = (detail.characters || []).map(function (c) {
+                if (!c.name) return null;
+                return new Actor({ name: c.name, role: c.role || "", image: fixUrl(c.image_url) });
+            }).filter(Boolean);
+
+            const recommendations = ((recsRes && recsRes.data) || []).map(mediaItemFromPost).filter(Boolean);
+
+            const item = new MultimediaItem({
+                title: detail.title || "Unknown Title",
+                url: url,
+                posterUrl: posterUrl,
+                type: "anime",
+                year: detail.year ? digitsOnly(detail.year) : undefined,
+                score: detail.score ? Number(detail.score) : undefined,
+                description: detail.description || "",
+                cast: cast,
+                recommendations: recommendations
+            });
+            item.tags = genres;
+            item.episodes = episodes;
+
+            cb({ success: true, data: item });
+        } catch (e) {
+            cb({ success: false, errorCode: "PARSE_ERROR", message: e.message || String(e) });
+        }
+    }
+
+    // ===================== 4. loadStreams =====================
+
+    const HY_HOSTS = ["abysscdn.com", "playhydrax.com", "zplayer.io", "short.ink", "abyssplayer.com", "short.icu"];
+
+    function isHydraxUrl(url) {
+        const host = getHost(url);
+        return HY_HOSTS.some(function (h) { return host.indexOf(h) !== -1; });
+    }
+
+    // Cloudflare Worker (worker.js) that fully resolves HY/Hydrax playback
+    // (decrypts the embed's `datas` blob itself, then relays segments with
+    // fresh AES-CTR tokens per Range request) and also patches the FE
+    // server's MPEG-TS byte-offset bug via /proxy. Deploy worker.js and put
+    // its base URL here — without this, HY won't play and FE may glitch.
+    const WORKER_BASE = "https://YOUR-WORKER-SUBDOMAIN.workers.dev";
+
+    function getHydraxVideoId(url) {
+        try {
+            const u = new URL(url);
             if (u.hostname.indexOf("short.ink") !== -1) {
                 const parts = u.pathname.split("/").filter(Boolean);
                 return parts[parts.length - 1] || null;
@@ -60,422 +331,123 @@
         }
     }
 
-    // Cache token trong phiên chạy hiện tại (tương đương cachedToken trong bản Kotlin)
-    let cachedToken = null;
+    // Resolves an Abyss/Hydrax "HY" embed URL into a playable source by
+    // handing the raw video id off to the Worker's /hydrax endpoint, which
+    // does the full decrypt-and-relay itself (see worker.js). The Worker
+    // picks the highest-quality source by default; pass ?res=<index> on the
+    // relay URL to pin a specific one if ever needed.
+    async function extractHydrax(embedUrl) {
+        const streams = [];
+        const videoId = getHydraxVideoId(embedUrl);
+        if (!videoId) return streams;
 
-    // ===================== Helpers =====================
-
-    function fixUrl(url) {
-        if (!url) return null;
-        if (url.indexOf("via.placeholder.com") !== -1) return null;
-        if (/^http/i.test(url)) return url;
-        if (url.startsWith("//")) return "https:" + url;
-        const path = url.startsWith("/") ? url : "/" + url;
-        const base = manifest.baseUrl || "https://anime47.best";
-        return /^http/i.test(base) ? base + path : "https:" + base + path;
+        const relayUrl = WORKER_BASE + "/hydrax?v=" + encodeURIComponent(videoId);
+        streams.push(new StreamResult({
+            url: relayUrl,
+            quality: "HY",
+            headers: { "User-Agent": UA }
+        }));
+        return streams;
     }
 
-    function toIntOrNull(v) {
-        if (v === null || v === undefined) return null;
-        const n = parseInt(String(v).replace(/[^\d]/g, ""), 10);
-        return Number.isNaN(n) ? null : n;
+    async function getText(url, headers) {
+        const res = await http_get(url, headers || HEADERS);
+        return res && res.body ? res.body : "";
     }
 
-    function mapSubtitleLabel(label) {
-        const trimmed = (label || "").trim();
-        const lower = trimmed.toLowerCase();
-        if (!lower) return "Subtitle";
-        for (const standardName in SUBTITLE_LANGUAGE_MAP) {
-            const keywords = SUBTITLE_LANGUAGE_MAP[standardName];
-            if (keywords.some((k) => lower.indexOf(k) !== -1)) {
-                return standardName;
-            }
-        }
-        return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+    function mapSubtitleLang(label) {
+        const l = String(label || "").toLowerCase();
+        if (l.indexOf("việt") !== -1 || l.indexOf("viet") !== -1 || l === "vi") return "vi";
+        if (l.indexOf("anh") !== -1 || l.indexOf("eng") !== -1 || l === "en") return "en";
+        return "vi";
     }
 
-    function determineType(detail) {
-        // Bản gốc luôn map về TvType.Anime/Cartoon để không mất tập với "movie" nhiều phần.
-        // Với schema SkyStream (movie/series/anime/livestream), Anime47 luôn là "anime".
-        return "anime";
-    }
+    async function loadStreamsForEpisodeId(episodeId, referer) {
+        const streams = [];
+        const subtitles = [];
 
-    async function httpGetJson(url, headers) {
-        const res = await http_get(url, headers || {});
-        const text = res.body;
-        if (typeof text === "string" && text.indexOf('"PRIVATE_MODE"') !== -1) {
-            throw new Error(
-                "Trang web yêu cầu đăng nhập. Vui lòng kiểm tra tài khoản Anime47 trong code plugin."
-            );
-        }
-        try {
-            return typeof text === "string" ? JSON.parse(text) : text;
-        } catch (e) {
-            throw new Error("Không parse được JSON từ " + url + ": " + e.message);
-        }
-    }
+        const watch = await getJson(API_BASE + "/anime/watch/episode/" + episodeId + "?lang=vi");
+        const streamList = (watch && watch.streams) || [];
 
-    async function ensureToken() {
-        if (cachedToken) return cachedToken;
-        if (!ACCOUNT_EMAIL || !ACCOUNT_PASSWORD || ACCOUNT_EMAIL.indexOf("example.com") !== -1) {
-            return null;
-        }
-        try {
-            const body = JSON.stringify({ login: ACCOUNT_EMAIL, password: ACCOUNT_PASSWORD });
-            const res = await http_post(
-                API_BASE + "/auth/login",
-                {
-                    origin: manifest.baseUrl,
-                    referer: manifest.baseUrl + "/",
-                    "Content-Type": "application/json",
-                },
-                body
-            );
-            const data = JSON.parse(res.body);
-            cachedToken = data.access_token || null;
-            return cachedToken;
-        } catch (e) {
-            return null;
-        }
-    }
+        for (const s of streamList) {
+            if (!s.url) continue;
 
-    async function getAuthHeaders() {
-        const token = await ensureToken();
-        return token ? { Authorization: "Bearer " + token } : {};
-    }
-
-    async function fetchApi(url) {
-        const authHeaders = await getAuthHeaders();
-        return httpGetJson(url, authHeaders);
-    }
-
-    // Dùng cho: mainpage "Post" và "RecommendationItem" (API trả field "poster")
-    function createMultimediaItemFromPost(post) {
-        const link = fixUrl(post.link);
-        if (!link) return null;
-        const episodesStr = post.current_episode || post.episodes;
-        return new MultimediaItem({
-            title: post.title,
-            url: link,
-            posterUrl: fixUrl(post.poster) || "",
-            type: "anime",
-            year: toIntOrNull(post.year) || undefined,
-            description: episodesStr ? "Tập hiện tại: " + episodesStr : undefined,
-        });
-    }
-
-    // Dùng cho: "SearchItem" (API trả field "image" thay vì "poster")
-    function createMultimediaItemFromSearchItem(item) {
-        const link = fixUrl(item.link);
-        if (!link) return null;
-        const episodesStr = item.current_episode || item.episodes;
-        return new MultimediaItem({
-            title: item.title,
-            url: link,
-            posterUrl: fixUrl(item.image) || "",
-            type: "anime",
-            description: episodesStr ? "Tập hiện tại: " + episodesStr : undefined,
-        });
-    }
-
-    // ===================== Core: getHome =====================
-
-    async function getHome(cb) {
-        try {
-            const pages = [
-                { key: "Mới Cập Nhật", path: "/anime/filter?lang=vi&sort=latest" },
-                { key: "Top Đánh Giá", path: "/anime/filter?lang=vi&sort=rating" },
-                { key: "Anime TV", path: "/anime/filter?lang=vi&type=tv" },
-                { key: "Anime Movie", path: "/anime/filter?lang=vi&type=movie" },
-            ];
-
-            const data = {};
-
-            for (const page of pages) {
-                try {
-                    const url = API_BASE + page.path + "&page=1";
-                    const response = await fetchApi(url);
-                    const posts = (response && response.data && response.data.posts) || [];
-                    const items = posts
-                        .map((post) => createMultimediaItemFromPost(post))
-                        .filter(Boolean);
-                    if (items.length > 0) {
-                        data[page.key] = items;
-                    }
-                } catch (e) {
-                    // Bỏ qua lỗi từng category riêng lẻ, các category khác vẫn hiển thị.
-                }
+            if (isHydraxUrl(s.url)) {
+                const hyStreams = await extractHydrax(s.url);
+                streams.push.apply(streams, hyStreams);
+            } else {
+                // Direct m3u8/TS server (FE, or any other server name). Route
+                // through the Worker's /proxy so the MPEG-TS byte-offset bug
+                // (nonprofit.asia CDN prepending junk bytes before the TS
+                // sync byte) gets patched, matching the original Kotlin
+                // provider's getVideoInterceptor() behavior.
+                const proxied = WORKER_BASE + "/proxy?u=" + encodeURIComponent(s.url);
+                streams.push(new StreamResult({
+                    url: proxied,
+                    quality: s.server_name || "Auto",
+                    headers: { "User-Agent": UA }
+                }));
             }
 
-            if (Object.keys(data).length === 0) {
-                cb({
-                    success: false,
-                    errorCode: "NOT_FOUND",
-                    message: "Không tải được dữ liệu trang chủ Anime47.",
+            (s.subtitles || []).forEach(function (sub) {
+                if (!sub.file) return;
+                subtitles.push({
+                    url: sub.file,
+                    label: sub.label || "Vietnamese",
+                    lang: mapSubtitleLang(sub.label)
                 });
-                return;
-            }
-
-            // "Mới Cập Nhật" đóng vai trò Trending (Hero Carousel)
-            if (data["Mới Cập Nhật"]) {
-                data["Trending"] = data["Mới Cập Nhật"];
-            }
-
-            cb({ success: true, data });
-        } catch (e) {
-            cb({ success: false, errorCode: "PARSE_ERROR", message: e.stack || String(e) });
-        }
-    }
-
-    // ===================== Core: search =====================
-
-    async function search(query, cb) {
-        try {
-            const encoded = encodeURIComponent(query);
-            const url = API_BASE + "/search/full/?lang=vi&keyword=" + encoded + "&page=1";
-            const response = await fetchApi(url);
-            const results = (response && response.results) || [];
-
-            const items = results
-                .map((item) => createMultimediaItemFromSearchItem(item))
-                .filter(Boolean);
-
-            cb({ success: true, data: items });
-        } catch (e) {
-            cb({ success: false, errorCode: "SEARCH_ERROR", message: e.stack || String(e) });
-        }
-    }
-
-    // ===================== Core: load =====================
-
-    function extractAnimeId(url) {
-        const match = url.replace(/\/$/, "").match(/(\d+)(?:\.html|\/)?$/);
-        return match ? match[1] : null;
-    }
-
-    async function load(url, cb) {
-        try {
-            const animeId = extractAnimeId(url);
-            if (!animeId) {
-                cb({
-                    success: false,
-                    errorCode: "LOAD_ERROR",
-                    message: "Không tìm thấy ID anime hợp lệ từ URL: " + url,
-                });
-                return;
-            }
-
-            const [infoResponse, episodeResponse, recsResponse] = await Promise.all([
-                fetchApi(API_BASE + "/anime/info/" + animeId + "?lang=vi").catch(() => null),
-                fetchApi(API_BASE + "/anime/" + animeId + "/episodes?lang=vi").catch(() => null),
-                fetchApi(API_BASE + "/anime/info/" + animeId + "/recommendations?lang=vi").catch(
-                    () => null
-                ),
-            ]);
-
-            const detail = infoResponse && infoResponse.data;
-            if (!detail) {
-                cb({
-                    success: false,
-                    errorCode: "LOAD_ERROR",
-                    message: "Lỗi tải thông tin phim: dữ liệu rỗng.",
-                });
-                return;
-            }
-
-            const title = detail.title || "Unknown Title";
-            const posterUrl = fixUrl(detail.poster) || "";
-            const bannerUrl = fixUrl(detail.cover) || undefined;
-            const plot = detail.description || "";
-            const tags = (detail.genres || []).map((g) => g.name).filter(Boolean);
-            const year = toIntOrNull(detail.year) || undefined;
-            const score = typeof detail.score === "number" ? detail.score : undefined;
-
-            const cast = (detail.characters || [])
-                .filter((c) => c.name)
-                .map(
-                    (c) =>
-                        new Actor({
-                            name: c.name,
-                            role: c.role || undefined,
-                            image: fixUrl(c.image_url) || undefined,
-                        })
-                );
-
-            // Gom tập theo "number" trên toàn bộ team/group, giống groupBy { number } trong bản Kotlin.
-            // Mỗi tập có thể có nhiều bản dịch (nhiều id) -> lưu mảng id vào Episode.url dạng JSON.
-            const allEpisodeItems = [];
-            (episodeResponse && episodeResponse.teams ? episodeResponse.teams : []).forEach(
-                (team) => {
-                    (team.groups || []).forEach((group) => {
-                        (group.episodes || []).forEach((ep) => {
-                            if (ep.number !== null && ep.number !== undefined) {
-                                allEpisodeItems.push(ep);
-                            }
-                        });
-                    });
-                }
-            );
-
-            const grouped = {};
-            allEpisodeItems.forEach((ep) => {
-                const num = ep.number;
-                if (!grouped[num]) grouped[num] = [];
-                if (grouped[num].indexOf(ep.id) === -1) grouped[num].push(ep.id);
             });
-
-            const episodes = Object.keys(grouped)
-                .map((numStr) => {
-                    const number = parseInt(numStr, 10);
-                    const ids = grouped[numStr];
-                    return new Episode({
-                        name: "Tập " + number,
-                        url: JSON.stringify(ids),
-                        season: 1,
-                        episode: number,
-                        dubStatus: "subbed",
-                    });
-                })
-                .sort((a, b) => a.episode - b.episode);
-
-            const recommendations = ((recsResponse && recsResponse.data) || [])
-                .map((item) => createMultimediaItemFromPost(item))
-                .filter(Boolean);
-
-            cb({
-                success: true,
-                data: new MultimediaItem({
-                    title,
-                    url,
-                    posterUrl,
-                    bannerUrl,
-                    type: determineType(detail),
-                    description: plot,
-                    year,
-                    score,
-                    tags,
-                    cast,
-                    recommendations,
-                    episodes,
-                    headers: { Referer: manifest.baseUrl + "/" },
-                }),
-            });
-        } catch (e) {
-            cb({ success: false, errorCode: "LOAD_ERROR", message: e.stack || String(e) });
         }
-    }
 
-    // ===================== Core: loadStreams =====================
+        return { streams, subtitles };
+    }
 
     async function loadStreams(url, cb) {
         try {
+            // `url` here is the Episode.url we built in load(): a JSON array
+            // of episode ids, or (fallback) a single numeric id string.
             let episodeIds;
             try {
                 episodeIds = url.trim().startsWith("[") ? JSON.parse(url) : [parseInt(url, 10)];
             } catch (e) {
-                cb({ success: false, errorCode: "STREAM_ERROR", message: "Dữ liệu tập không hợp lệ." });
-                return;
+                episodeIds = [parseInt(url, 10)];
+            }
+            episodeIds = episodeIds.filter(function (n) { return Number.isFinite(n); });
+            if (!episodeIds.length) {
+                return cb({ success: false, errorCode: "PARSE_ERROR", message: "Episode id không hợp lệ." });
             }
 
-            if (!episodeIds || episodeIds.length === 0) {
-                cb({ success: true, data: [] });
-                return;
+            const referer = MAIN_URL + "/";
+            const allStreams = [];
+            const allSubs = [];
+            const seen = {};
+
+            for (const id of episodeIds) {
+                try {
+                    const result = await loadStreamsForEpisodeId(id, referer);
+                    result.streams.forEach(function (st) {
+                        const key = st.url;
+                        if (seen[key]) return;
+                        seen[key] = true;
+                        allStreams.push(st);
+                    });
+                    allSubs.push.apply(allSubs, result.subtitles);
+                } catch (e) {
+                    // ignore this team's episode id, try the next
+                }
             }
 
-            const referer = manifest.baseUrl + "/";
-            const streamResults = [];
+            if (!allStreams.length) {
+                return cb({ success: false, errorCode: "NOT_FOUND", message: "Không tìm thấy link phát nào." });
+            }
 
-            const authHeaders = await getAuthHeaders();
+            if (allSubs.length && allStreams[0]) {
+                allStreams[0].subtitles = allSubs;
+            }
 
-            await Promise.all(
-                episodeIds.map(async (id) => {
-                    try {
-                        const watchUrl = API_BASE + "/anime/watch/episode/" + id + "?lang=vi";
-                        const watchResponse = await httpGetJson(watchUrl, authHeaders);
-                        const streams = (watchResponse && watchResponse.streams) || [];
-
-                        for (const stream of streams) {
-                            let streamUrl = stream.url;
-                            if (!streamUrl) continue;
-
-                            const isVlogphim = streamUrl.indexOf("vlogphim.net") !== -1;
-                            const isHydrax = HYDRAX_HOSTS.some((h) => streamUrl.indexOf(h) !== -1);
-                            let usingWorkerProxy = false;
-
-                            if (isVlogphim && WORKER_PROXY_BASE) {
-                                // Server FE dùng CDN cdn<N>.nonprofit.asia cho các segment .ts, CDN này
-                                // trả về vài byte rác ở đầu mỗi segment (lỗi offset MPEG-TS). Route qua
-                                // Worker để vá lỗi đó — Worker tự gắn Referer khi gọi ngược lại CDN gốc,
-                                // nên client (SkyStream) chỉ cần gọi thẳng domain Worker, không cần giả
-                                // header của domain gốc (Origin/authority) nữa.
-                                streamUrl =
-                                    WORKER_PROXY_BASE.replace(/\/$/, "") +
-                                    "/proxy?u=" +
-                                    encodeURIComponent(streamUrl);
-                                usingWorkerProxy = true;
-                            } else if (isHydrax && WORKER_PROXY_BASE) {
-                                // Server HY (Hydrax/Abyss) không trả link phát trực tiếp — trang embed
-                                // chứa 1 blob mã hoá AES-CTR cần giải mã để lấy danh sách CDN nguồn, và
-                                // video được chia thành segment 2MB cũng mã hoá riêng từng phần. Worker
-                                // tự giải mã + ghép segment + giả lập 1 file .mp4 phản hồi đúng Range
-                                // request của player. Chỉ cần truyền videoId (tham số "v" của URL gốc).
-                                const videoId = getHydraxVideoId(streamUrl);
-                                if (videoId) {
-                                    streamUrl =
-                                        WORKER_PROXY_BASE.replace(/\/$/, "") +
-                                        "/hydrax?v=" +
-                                        encodeURIComponent(videoId);
-                                    usingWorkerProxy = true;
-                                }
-                            }
-
-                            const headers = usingWorkerProxy
-                                ? {
-                                      "User-Agent": DEFAULT_UA,
-                                  }
-                                : {
-                                      Referer: referer,
-                                      "User-Agent": DEFAULT_UA,
-                                      "sec-ch-ua": '"Chromium";v="120", "Not?A_Brand";v="24"',
-                                      "sec-ch-ua-mobile": "?1",
-                                      "sec-ch-ua-platform": '"Android"',
-                                  };
-
-                            if (isVlogphim && !usingWorkerProxy) {
-                                headers["Origin"] = referer;
-                                try {
-                                    headers["authority"] = new URL(streamUrl).host;
-                                } catch (e) {
-                                    headers["authority"] = "pl.vlogphim.net";
-                                }
-                            }
-
-                            const subtitles = (stream.subtitles || [])
-                                .filter((s) => s.file)
-                                .map((s) => ({
-                                    url: s.file,
-                                    label: mapSubtitleLabel(s.label || "Vietnamese"),
-                                    lang: mapSubtitleLabel(s.label || "Vietnamese"),
-                                }));
-
-                            streamResults.push(
-                                new StreamResult({
-                                    url: streamUrl,
-                                    source: stream.server_name || "Anime47",
-                                    headers,
-                                    subtitles: subtitles.length > 0 ? subtitles : undefined,
-                                })
-                            );
-                        }
-                    } catch (e) {
-                        // Bỏ qua lỗi từng episode id riêng lẻ, các stream khác vẫn trả về.
-                    }
-                })
-            );
-
-            cb({ success: true, data: streamResults });
+            cb({ success: true, data: allStreams });
         } catch (e) {
-            cb({ success: false, errorCode: "STREAM_ERROR", message: e.stack || String(e) });
+            cb({ success: false, errorCode: "PARSE_ERROR", message: e.message || String(e) });
         }
     }
 
